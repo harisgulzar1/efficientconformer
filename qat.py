@@ -193,46 +193,6 @@ def main(rank, args):
 
     ###########################################
 
-
-        model.to('cpu')
-        # Make a copy of the model for layer fusion
-        fused_model = copy.deepcopy(model)
-
-        model.train()
-        # The model has to be switched to training mode before any layer fusion.
-        # Otherwise the quantization aware training will not work correctly.
-        fused_model.train()
-        
-
-        #print(nested_children(model))
-        #named_layers = dict(model.named_modules())
-        #print(named_layers)
-        #summary(model, (1, 254400, 1, 117, 1, 1))
-        # Fuse the model in place rather manually.
-        #for name, layer in model.named_modules():
-            #print(name)
-        print("FUSION!")
-        #fused_model = torch.quantization.fuse_modules(fused_model, [["encoder.subsampling_module.layers.0.0", "encoder.subsampling_module.layers.0.1"]], inplace=True)
-        # for module_name, module in fused_model.named_children():
-        #     if "layer" in module_name:
-        #         for basic_block_name, basic_block in module.named_children():
-        #             torch.quantization.fuse_modules(basic_block, [["conv1", "bn1", "relu1"], ["conv2", "bn2"]], inplace=True)
-        #             for sub_block_name, sub_block in basic_block.named_children():
-        #                 if sub_block_name == "downsample":
-        #                     torch.quantization.fuse_modules(sub_block, [["0", "1"]], inplace=True)
-        
-        # Print FP32 model.
-        #print(model)
-        # Print fused model.
-        #print(fused_model)
-
-        # Model and fused model should be equivalent.
-        model.eval()
-        fused_model.eval()
-        #assert model_equivalence(model_1=model, model_2=fused_model, device='cpu', rtol=1e-03, atol=1e-06, num_tests=100, input_size=((1, 12345, 80), 9)), "Fused model is not equivalent to the original model!"
-
-        # Prepare the model for quantization aware training. This inserts observers in
-        # the model that will observe activation tensors during calibration.
         quantized_model = QuantizedConf(
             encoder_params=config["encoder_params"],
             tokenizer_params=config["tokenizer_params"],
@@ -244,6 +204,24 @@ def main(rank, args):
         # quantized_model = QuantizedConf(model_fp32=model)
         # Select quantization schemes from 
         # https://pytorch.org/docs/stable/quantization-support.html
+        print(quantized_model)
+        quantized_model.train()
+        print("FUSION!")
+        quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.layers.0.0", "encoder.subsampling_module.layers.0.1"]], inplace=True)
+        for i in range(14):
+            #quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.2", f"encoder.blocks.{i}.convolution_module.layers.3"]], inplace=True)
+            quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.4", f"encoder.blocks.{i}.convolution_module.layers.5"]], inplace=True)
+        # for module_name, module in fused_model.named_children():
+        #     if "layer" in module_name:
+        #         for basic_block_name, basic_block in module.named_children():
+        #             torch.quantization.fuse_modules(basic_block, [["conv1", "bn1", "relu1"], ["conv2", "bn2"]], inplace=True)
+        #             for sub_block_name, sub_block in basic_block.named_children():
+        #                 if sub_block_name == "downsample":
+        #                     torch.quantization.fuse_modules(sub_block, [["0", "1"]], inplace=True)
+
+
+        quantized_model.eval()
+        quantized_model.to('cpu')
         quantization_config = torch.quantization.get_default_qconfig("fbgemm")
         # Custom quantization configurations
         # quantization_config = torch.quantization.default_qconfig
@@ -255,12 +233,13 @@ def main(rank, args):
         #print(quantized_model.qconfig)
 
         # https://pytorch.org/docs/stable/_modules/torch/quantization/quantize.html#prepare_qat
-        torch.quantization.prepare_qat(quantized_model, inplace=True)
+        torch.quantization.prepare_qat(quantized_model.encoder, inplace=True)
+        #torch.quantization.prepare_qat(quantized_model., inplace=True)
+        print(quantized_model)
 
         # # Use training data for calibration.
         print("Training QAT Model...")
         quantized_model.train()
-        model.to(device)
         quantized_model.to(device)
 
     #######################################
@@ -279,7 +258,7 @@ def main(rank, args):
             saving_period=args.saving_period,
             val_period=args.val_period)
         
-        #quantized_model.to('cpu')
+        quantized_model.to('cpu')
 
         # Using high-level static quantization wrapper
         # The above steps, including torch.quantization.prepare, calibrate_model, and torch.quantization.convert, are also equivalent to
@@ -287,10 +266,10 @@ def main(rank, args):
 
         #quantized_model = torch.quantization.convert(quantized_model, inplace=True)
 
-        model_fp32_prepared.eval()
-
         # Print quantized model.
-        model_int8 = torch.quantization.convert(model_fp32_prepared)
+        model_int8 = torch.quantization.convert(quantized_model, inplace=True)
+        quantized_model.eval()
+        
         model=model_int8
 
     # Evaluation
