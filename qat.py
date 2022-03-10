@@ -47,16 +47,20 @@ class QuantizedConf(ModelCTC):
         # point to quantized in the quantized model
 
         x, _, x_len, _ = batch
-        
+        print("0", x.type())
         x = self.quant(x)
+        # print("BEGIN", x.type())
         logits, logits_len, attentions = self.encoder(x, x_len)
         
         # manually specify where tensors will be converted from quantized
         # to floating point in the quantized model
-                # Tokenizer
-        logits = self.fc(logits)
-
-        x = self.dequant(logits)
+        # Tokenizer
+        # print(logits)
+        x = self.fc(logits)
+        # print(x)
+        x = self.dequant(x)
+        # print("FINAL: ", x.type())
+        
 
         return x, logits_len, attentions
 
@@ -109,7 +113,8 @@ def main(rank, args):
         config = json.load(json_config)
 
     # Device
-    device = torch.device("cuda:" + str(args.rank) if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = torch.device("cuda:1")
+    # device = torch.device("cuda:" + str(args.rank) if torch.cuda.is_available() and not args.cpu else "cpu")
     print("Device:", device)
 
     # Create Tokenizer
@@ -128,6 +133,7 @@ def main(rank, args):
     # Load Model
     if args.initial_epoch is not None:
         model.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
+        print("Model Loaded!")
     else:
         args.initial_epoch = 0
 
@@ -206,11 +212,18 @@ def main(rank, args):
         # https://pytorch.org/docs/stable/quantization-support.html
         print(quantized_model)
         quantized_model.train()
+
+        quantconfig = torch.quantization.get_default_qconfig("fbgemm")
+        print(quantconfig)
+        quantized_model.qconfig = quantconfig
+        quantized_model.encoder.preprocessing.qconfig = None
+        quantized_model.encoder.augment.qconfig = None
+
         print("FUSION!")
-        quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.layers.0.0", "encoder.subsampling_module.layers.0.1"]], inplace=True)
-        for i in range(14):
+        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.layers.0.0", "encoder.subsampling_module.layers.0.1"]], inplace=True)
+        #for i in range(14):
             #quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.2", f"encoder.blocks.{i}.convolution_module.layers.3"]], inplace=True)
-            quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.4", f"encoder.blocks.{i}.convolution_module.layers.5"]], inplace=True)
+            #quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.4", f"encoder.blocks.{i}.convolution_module.layers.5"]], inplace=True)
         # for module_name, module in fused_model.named_children():
         #     if "layer" in module_name:
         #         for basic_block_name, basic_block in module.named_children():
@@ -219,33 +232,13 @@ def main(rank, args):
         #                 if sub_block_name == "downsample":
         #                     torch.quantization.fuse_modules(sub_block, [["0", "1"]], inplace=True)
 
+        quantized_model_prepared = torch.quantization.prepare(quantized_model)
 
-        quantized_model.eval()
-        quantized_model.to('cpu')
-        quantization_config = torch.quantization.get_default_qconfig("fbgemm")
-        # Custom quantization configurations
-        # quantization_config = torch.quantization.default_qconfig
-        # quantization_config = torch.quantization.QConfig(activation=torch.quantization.MinMaxObserver.with_args(dtype=torch.quint8), weight=torch.quantization.MinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_tensor_symmetric))
+        #######################################
+        # quantized_model_prepared.train()
+        quantized_model_prepared.to(device)
 
-        quantized_model.qconfig = quantization_config
-        
-        # Print quantization configurations
-        #print(quantized_model.qconfig)
-
-        # https://pytorch.org/docs/stable/_modules/torch/quantization/quantize.html#prepare_qat
-        torch.quantization.prepare_qat(quantized_model.encoder, inplace=True)
-        #torch.quantization.prepare_qat(quantized_model., inplace=True)
-        print(quantized_model)
-
-        # # Use training data for calibration.
-        print("Training QAT Model...")
-        quantized_model.train()
-        quantized_model.to(device)
-
-    #######################################
-
-    
-        quantized_model.fit(dataset_train, 
+        quantized_model_prepared.fit(dataset_train, 
             config["training_params"]["epochs"], 
             dataset_val=dataset_val, 
             val_steps=args.val_steps, 
@@ -258,7 +251,39 @@ def main(rank, args):
             saving_period=args.saving_period,
             val_period=args.val_period)
         
-        quantized_model.to('cpu')
+        quantized_model_prepared.to('cpu')
+
+        model_int8 = torch.quantization.convert(quantized_model_prepared, inplace=True)
+        print(model_int8)
+        torch.save(model_int8, 'model_q.ckpt')
+        print("Gready Search Evaluation")
+        wer, _, _, _ = model_int8.evaluate(dataset_val, eval_steps=args.val_steps, verbose=args.verbose_val, beam_size=1, eval_loss=args.eval_loss)
+        if args.rank == 0:
+            print("Geady Search WER : {:.2f}%".format(100 * wer))
+        
+        # quantized_model.eval()
+        # quantized_model.to('cpu')
+        
+        # Custom quantization configurations
+        # quantization_config = torch.quantization.default_qconfig
+        # quantization_config = torch.quantization.QConfig(activation=torch.quantization.MinMaxObserver.with_args(dtype=torch.quint8), weight=torch.quantization.MinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_tensor_symmetric))
+        # quantized_model.encoder.qconfig = quantization_config
+        # torch.backends.quantized.engine = 'fbgemm'
+        # # Print quantization configurations
+        #print(quantized_model.qconfig)
+
+        # https://pytorch.org/docs/stable/_modules/torch/quantization/quantize.html#prepare_qat
+
+        # torch.quantization.prepare_qat(quantized_model.fc, inplace=True)
+        #torch.quantization.prepare_qat(quantized_model., inplace=True)
+        # print(quantized_model.fc)
+
+        # # Use training data for calibration.
+        # print("Training QAT Model...")
+        # quantized_model.train()
+        # quantized_model.to(device)
+        #print(quantized_model.fc)
+
 
         # Using high-level static quantization wrapper
         # The above steps, including torch.quantization.prepare, calibrate_model, and torch.quantization.convert, are also equivalent to
@@ -267,10 +292,10 @@ def main(rank, args):
         #quantized_model = torch.quantization.convert(quantized_model, inplace=True)
 
         # Print quantized model.
-        model_int8 = torch.quantization.convert(quantized_model, inplace=True)
-        quantized_model.eval()
-        
-        model=model_int8
+
+        # model_int8.eval()
+        # torch.save(model_int8.state_dict())
+        # model=model_int8
 
     # Evaluation
     elif args.mode.split("-")[0] == "validation" or args.mode.split("-")[0] == "test":
@@ -328,9 +353,9 @@ if __name__ == "__main__":
     # Args
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config_file",          type=str,   default="configs/EfficientConformerCTCSmall.json",  help="Json configuration file containing model hyperparameters")
-    parser.add_argument("-m", "--mode",                 type=str,   default="training",                               help="Mode : training, validation-clean, test-clean, eval_time, audio_lat, ...")
+    parser.add_argument("-m", "--mode",                 type=str,   default="training",                                 help="Mode : training, validation-clean, test-clean, eval_time, audio_lat, ...")
     parser.add_argument("-d", "--distributed",          type=str,   default=None,                                       help="Distributed data parallelization")
-    parser.add_argument("-i", "--initial_epoch",        type=str,   default=None) #"swa-equal-401-450",                        help="Load model from checkpoint")
+    parser.add_argument("-i", "--initial_epoch",        type=str,   default= "1",                                       help="Load model from checkpoint")
     parser.add_argument("-lm", "--initial_epoch_lm",    type=str,   default=None,                                       help="Load language model from checkpoint")
     parser.add_argument("--initial_epoch_encoder",      type=str,   default=None,                                       help="Load model encoder from encoder checkpoint")
     parser.add_argument("-p", "--prepare_dataset",      action="store_true",                                            help="Prepare dataset for training")
