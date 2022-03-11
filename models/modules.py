@@ -16,7 +16,7 @@
 import torch
 import torch.nn as nn
 import torchaudio
-from torch.quantization import QuantStub, DeQuantStub
+# from torch.quantization import QuantStub, DeQuantStub
 
 # Attentions
 from models.attentions import (
@@ -80,19 +80,23 @@ class AudioPreprocessing(nn.Module):
         self.win_length = int(sample_rate * win_length_ms) // 1000
         self.hop_length = int(sample_rate * hop_length_ms) // 1000
         self.Spectrogram = torchaudio.transforms.Spectrogram(n_fft, self.win_length, self.hop_length)
-        self.MelScale = torchaudio.transforms.MelScale(n_mels, sample_rate, f_min=0, f_max=8000, n_stft=n_fft // 2 + 1)
+        self.MelScale = torchaudio.transforms.MelScale(n_mels, sample_rate, f_min=0, f_max=8000, n_stft=n_fft // 2 + 1, mel_scale='slaney')
         self.normalize = normalize
         self.mean = mean
         self.std = std
+        self.dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x, x_len):
-
+        print("Pre: ", x.type())
         # Short Time Fourier Transform (B, T) -> (B, n_fft // 2 + 1, T // hop_length + 1)
         x = self.Spectrogram(x)
-
+        
         # Mel Scale (B, n_fft // 2 + 1, T // hop_length + 1) -> (B, n_mels, T // hop_length + 1)
         x = self.MelScale(x)
-        
+        # print("Mid: ", x.type())
+        # print("3", x.type())
+        # x=x.type(torch.float32) #x = self.dequant(x)
+        # print("4", x.type())
         # Energy log, autocast disabled to prevent float16 overflow
         x = (x.float() + 1e-9).log().type(x.dtype)
 
@@ -103,7 +107,7 @@ class AudioPreprocessing(nn.Module):
         # Normalize
         if self.normalize:
             x = (x - self.mean) / self.std
-
+        print("Post: ", x.type())
         return x, x_len
 
 class SpecAugment(nn.Module):
@@ -135,7 +139,7 @@ class SpecAugment(nn.Module):
         self.pS = pS
 
     def forward(self, x, x_len):
-
+        print("PreAug: ", x.type())
         # Spec Augment
         if self.spec_augment:
         
@@ -148,7 +152,7 @@ class SpecAugment(nn.Module):
                 T = int(self.pS * x_len[b])
                 for _ in range(self.mT):
                     x[b, :, :x_len[b]] = torchaudio.transforms.TimeMasking(time_mask_param=T).forward(x[b, :, :x_len[b]])
-
+        print("PostAug: ", x.type())
         return x
 
 ###############################################################################
@@ -172,6 +176,7 @@ class Conv1dSubsampling(nn.Module):
         Output: (batch_size, out_dim, out_length)
     
     """
+
 
     def __init__(self, num_layers, in_dim, filters, kernel_size, norm, act):
         super(Conv1dSubsampling, self).__init__()
@@ -199,6 +204,78 @@ class Conv1dSubsampling(nn.Module):
 
         return x, x_len
 
+# class Conv2dSubsampling(nn.Module):
+
+#     """Conv2d Subsampling Block
+
+#     Args:
+#         num_layers: number of strided convolution layers
+#         filters: list of convolution layers filters
+#         kernel_size: convolution kernel size
+#         norm: normalization
+#         act: activation function
+
+#     Shape:
+#         Input: (batch_size, in_dim, in_length)
+#         Output: (batch_size, out_dim, out_length)
+    
+#     """
+
+#     def __init__(self, num_layers, filters, kernel_size, norm, act):
+#         super(Conv2dSubsampling, self).__init__()
+#         self.quant = torch.quantization.QuantStub()
+#         # Assert
+#         assert norm in ["batch", "layer", "none"]
+#         assert act in ["relu", "swish", "none"]
+#         print(num_layers)
+#         # Conv 2D Subsampling Layers
+#         self.layers = nn.ModuleList([nn.Sequential(
+#             nn.Conv2d(1 if layer_id == 0 else filters[layer_id - 1], filters[layer_id], kernel_size, stride=2, padding=(kernel_size - 1) // 2), 
+#             nn.BatchNorm2d(filters[layer_id]) if norm == "batch" else nn.LayerNorm(filters[layer_id]) if norm == "layer" else nn.Identity(),
+#             nn.ReLU() if act == "relu" else Swish() if act == "swish" else nn.Identity()
+#         ) for layer_id in range(num_layers)])
+#         # #~~~~~~~~~~~~~~~~~~~#
+
+#         # self.dequant = torch.quantization.DeQuantStub()
+#         # #~~~~~~~~~~~~~~~~~~~#
+
+
+#     def forward(self, x, x_len):
+
+#         # (B, D, T) -> (B, 1, D, T)
+#         # print(x)
+#         # #~~~~~~~~~~~~~~~~~~~#
+#         # x = self.quant(x)
+#         # print(x)
+#         # #~~~~~~~~~~~~~~~~~~~#
+#         x = x.unsqueeze(dim=1)
+#         # x = torch.dequantize(x)
+#         # print(x)
+#         # Layers
+
+#         # x = self.quant(x)
+#         for layer in self.layers:
+#             # print(layer.weight.type())
+#             #print("1",x.type())
+#             # print("1",x.type())
+#             # print("2",layer[0].weight)
+#             # print("2",layer[0].weight.type())
+#             # #print("2",layer[0].weight.dtype())
+#             # x=x.type(torch.float32) #x = self.dequant(x)
+#             x = layer(x)
+#             # print("Koko Made Yatta")
+#             # Update Sequence Lengths
+#             if x_len is not None:
+#                 x_len = torch.div(x_len - 1, 2, rounding_mode='floor') + 1
+
+#         # (B, C, D // S, T // S) -> (B,  C * D // S, T // S)
+#         batch_size, channels, subsampled_dim, subsampled_length = x.size()
+#         x = x.reshape(batch_size, channels * subsampled_dim, subsampled_length)
+#         # #~~~~~~~~~~~~~~~~~~~#
+#         # x = self.dequant(x)
+#         # #~~~~~~~~~~~~~~~~~~~#
+#         return x, x_len
+
 class Conv2dSubsampling(nn.Module):
 
     """Conv2d Subsampling Block
@@ -218,46 +295,32 @@ class Conv2dSubsampling(nn.Module):
 
     def __init__(self, num_layers, filters, kernel_size, norm, act):
         super(Conv2dSubsampling, self).__init__()
-
+        
         # Assert
         assert norm in ["batch", "layer", "none"]
         assert act in ["relu", "swish", "none"]
-
-        # Conv 2D Subsampling Layers
-        self.layers = nn.ModuleList([nn.Sequential(
-            nn.Conv2d(1 if layer_id == 0 else filters[layer_id - 1], filters[layer_id], kernel_size, stride=2, padding=(kernel_size - 1) // 2), 
-            nn.BatchNorm2d(filters[layer_id]) if norm == "batch" else nn.LayerNorm(filters[layer_id]) if norm == "layer" else nn.Identity(),
-            nn.ReLU() if act == "relu" else Swish() if act == "swish" else nn.Identity()
-        ) for layer_id in range(num_layers)])
-        # #~~~~~~~~~~~~~~~~~~~#
-        # self.quant = QuantStub()
-        # self.dequant = DeQuantStub()
-        # #~~~~~~~~~~~~~~~~~~~#
-
+        
+        self.conv1 = nn.Conv2d(1 , filters[0], kernel_size, stride=2, padding=(kernel_size - 1) // 2)
+        self.bn1   = nn.BatchNorm2d(filters[0]) if norm == "batch" else nn.LayerNorm(filters[0]) if norm == "layer" else nn.Identity()
+        self.relu1 = nn.ReLU() if act == "relu" else Swish() if act == "swish" else nn.Identity()
 
     def forward(self, x, x_len):
 
         # (B, D, T) -> (B, 1, D, T)
-
-        # #~~~~~~~~~~~~~~~~~~~#
-        # x = self.quant(x)
-        # #~~~~~~~~~~~~~~~~~~~#
         x = x.unsqueeze(dim=1)
 
         # Layers
-        for layer in self.layers:
-            x = layer(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
 
-            # Update Sequence Lengths
-            if x_len is not None:
-                x_len = torch.div(x_len - 1, 2, rounding_mode='floor') + 1
+        if x_len is not None:
+            x_len = torch.div(x_len - 1, 2, rounding_mode='floor') + 1
 
         # (B, C, D // S, T // S) -> (B,  C * D // S, T // S)
         batch_size, channels, subsampled_dim, subsampled_length = x.size()
         x = x.reshape(batch_size, channels * subsampled_dim, subsampled_length)
-        # #~~~~~~~~~~~~~~~~~~~#
-        # x = self.dequant(x)
-        # #~~~~~~~~~~~~~~~~~~~#
+
         return x, x_len
 
 class Conv2dPoolSubsampling(nn.Module):
@@ -404,7 +467,10 @@ class FeedForwardModule(nn.Module):
         )
 
     def forward(self, x):
-        return self.layers(x)
+        # print("2",x.type())
+        x = self.layers(x)
+        # print("2",x.type())
+        return x
 
 class MultiHeadSelfAttentionModule(nn.Module):
 
@@ -523,18 +589,22 @@ class ConvolutionModule(nn.Module):
         self.layers = nn.Sequential(
             nn.LayerNorm(dim_model, eps=1e-6),
             Transpose(1, 2),
-            Conv1d(dim_model, 2 * dim_expand, kernel_size=1),
+            nn.Conv1d(dim_model, 2 * dim_expand, kernel_size=1),
             Glu(dim=1),
-            Conv1d(dim_expand, dim_expand, kernel_size, stride=stride, padding=padding, groups=dim_expand),
+            Conv1d(dim_expand, dim_expand, kernel_size, stride=stride, padding = padding, groups=dim_expand),
             nn.BatchNorm1d(dim_expand),
             Swish(),
-            Conv1d(dim_expand, dim_expand, kernel_size=1),
+            nn.Conv1d(dim_expand, dim_expand, kernel_size=1),
             Transpose(1, 2),
             nn.Dropout(p=Pdrop)
         )
 
     def forward(self, x):
-        return self.layers(x)
+        # print(x.type())
+        # for layer in self.layers:
+        x = self.layers(x)
+            # print(layer, x.type())
+        return x
 
 ###############################################################################
 # ContextNet Modules

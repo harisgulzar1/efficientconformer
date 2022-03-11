@@ -37,6 +37,8 @@ from models.attentions import (
     StreamingMask
 )
 
+#from torch.quantization import QuantStub, DeQuantStub
+
 ###############################################################################
 # Encoder Models
 ###############################################################################
@@ -45,6 +47,7 @@ class ConformerEncoder(nn.Module):
 
     def __init__(self, params):
         super(ConformerEncoder, self).__init__()
+        self.quant = torch.quantization.QuantStub()
 
         # Audio Preprocessing
         self.preprocessing = AudioPreprocessing(params["sample_rate"], params["n_fft"], params["win_length_ms"], params["hop_length_ms"], params["n_mels"], params["normalize"], params["mean"], params["std"])
@@ -93,32 +96,49 @@ class ConformerEncoder(nn.Module):
             att_stride=(params["att_stride"][(block_id > torch.tensor(params.get("strided_blocks", []))).sum()] if isinstance(params["att_stride"], list) else params["att_stride"]) if block_id in params.get("strided_blocks", []) else 1,
             causal=params.get("causal", False)
         ) for block_id in range(params["num_blocks"])])
+        
+        self.dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x, x_len=None):
-
+        # print("INITIAL: ", x.type())
+        # x = self.quant(x)
+        # print("0", x.type())
         # Audio Preprocessing
+        # print(x)
         x, x_len = self.preprocessing(x, x_len)
 
         # Spec Augment
         if self.training:
             x = self.augment(x, x_len)
-        print("DEVICE:", x.device)
-        self.subsampling_module.to('cuda')
+        #print("DEVICE:", x.device)
+        #self.subsampling_module.to('cuda')
         # Subsampling Module
+        # print(x)
         x, x_len = self.subsampling_module(x, x_len)
 
         # Padding Mask
         mask = self.padding_mask(x, x_len)
 
         # Transpose (B, D, T) -> (B, T, D)
-        x = x.transpose(1, 2)
 
+        # x = self.dequant(x)
+        x = x.transpose(1, 2)
+        # x = self.quant(x)
         # Linear Projection
+        # print(x.type())
+        # x.type(torch.HalfTensor)
+        # print("1", x.type())
+        # print("2", self.linear.weight.type())
+        # # x = self.quant(x)
+        # print("3", x.type())
+        # x = self.dequant(x)
+        # print("4", x.type())
         x = self.linear(x)
+        
 
         # Dropout
         x = self.dropout(x)
-
+        # print("4", x.type())
         # Sinusoidal Positional Encodings
         if self.pos_enc is not None:
             x = x + self.pos_enc(x.size(0), x.size(1))
@@ -139,7 +159,7 @@ class ConformerEncoder(nn.Module):
                 # Update Seq Lengths
                 if x_len is not None:
                     x_len = torch.div(x_len - 1, block.stride, rounding_mode='floor') + 1
-
+        # print("5", x.type())
         return x, x_len, attentions
 
 class ConformerEncoderInterCTC(ConformerEncoder):
@@ -180,6 +200,7 @@ class ConformerEncoderInterCTC(ConformerEncoder):
         x = x.transpose(1, 2)
 
         # Linear Projection
+        x.type(torch.DoubleTensor)
         x = self.linear(x)
 
         # Dropout
