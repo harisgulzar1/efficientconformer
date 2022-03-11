@@ -47,7 +47,7 @@ class QuantizedConf(ModelCTC):
         # point to quantized in the quantized model
 
         x, _, x_len, _ = batch
-        print("0", x.type())
+        # print("0", x.type())
         x = self.quant(x)
         # print("BEGIN", x.type())
         logits, logits_len, attentions = self.encoder(x, x_len)
@@ -213,15 +213,11 @@ def main(rank, args):
         print(quantized_model)
         quantized_model.train()
 
-        quantconfig = torch.quantization.get_default_qconfig("fbgemm")
-        print(quantconfig)
-        quantized_model.qconfig = quantconfig
-        quantized_model.encoder.preprocessing.qconfig = None
-        quantized_model.encoder.augment.qconfig = None
-
         print("FUSION!")
-        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.layers.0.0", "encoder.subsampling_module.layers.0.1"]], inplace=True)
-        #for i in range(14):
+        quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.conv1", "encoder.subsampling_module.bn1", "encoder.subsampling_module.relu1"]], inplace=True)
+        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.linear", "encoder.dropout"]], inplace=True)
+       
+       #for i in range(14):
             #quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.2", f"encoder.blocks.{i}.convolution_module.layers.3"]], inplace=True)
             #quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.4", f"encoder.blocks.{i}.convolution_module.layers.5"]], inplace=True)
         # for module_name, module in fused_model.named_children():
@@ -232,13 +228,28 @@ def main(rank, args):
         #                 if sub_block_name == "downsample":
         #                     torch.quantization.fuse_modules(sub_block, [["0", "1"]], inplace=True)
 
-        quantized_model_prepared = torch.quantization.prepare(quantized_model)
+
+        quantconfig = torch.quantization.get_default_qconfig("fbgemm")
+        print(quantconfig)
+        
+        # quantized_model.encoder.subsampling_module.conv1.qconfig = quantconfig
+        quantized_model.qconfig = quantconfig
+        # quantized_model.encoder.linear.qconfig = quantconfig
+        # quantized_model.fc.qconfig = quantconfig
+
+        # quantized_model.encoder.preprocessing.qconfig = None
+        # quantized_model.encoder.augment.qconfig = None
+
+        torch.quantization.prepare_qat(quantized_model, inplace=True)
+        # torch.quantization.prepare_qat(quantized_model.encoder.subsampling_module.bn1, inplace=True)
+        # torch.quantization.prepare_qat(quantized_model.encoder.subsampling_module.relu1, inplace=True)
 
         #######################################
         # quantized_model_prepared.train()
-        quantized_model_prepared.to(device)
+        print(quantized_model)
+        quantized_model.to(device)
 
-        quantized_model_prepared.fit(dataset_train, 
+        quantized_model.fit(dataset_train, 
             config["training_params"]["epochs"], 
             dataset_val=dataset_val, 
             val_steps=args.val_steps, 
@@ -251,9 +262,9 @@ def main(rank, args):
             saving_period=args.saving_period,
             val_period=args.val_period)
         
-        quantized_model_prepared.to('cpu')
+        quantized_model.to('cpu')
 
-        model_int8 = torch.quantization.convert(quantized_model_prepared, inplace=True)
+        model_int8 = torch.quantization.convert(quantized_model, inplace=True)
         print(model_int8)
         torch.save(model_int8, 'model_q.ckpt')
         print("Gready Search Evaluation")
@@ -355,7 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config_file",          type=str,   default="configs/EfficientConformerCTCSmall.json",  help="Json configuration file containing model hyperparameters")
     parser.add_argument("-m", "--mode",                 type=str,   default="training",                                 help="Mode : training, validation-clean, test-clean, eval_time, audio_lat, ...")
     parser.add_argument("-d", "--distributed",          type=str,   default=None,                                       help="Distributed data parallelization")
-    parser.add_argument("-i", "--initial_epoch",        type=str,   default= "1",                                       help="Load model from checkpoint")
+    parser.add_argument("-i", "--initial_epoch",        type=str,   default= None,                                       help="Load model from checkpoint")
     parser.add_argument("-lm", "--initial_epoch_lm",    type=str,   default=None,                                       help="Load language model from checkpoint")
     parser.add_argument("--initial_epoch_encoder",      type=str,   default=None,                                       help="Load model encoder from encoder checkpoint")
     parser.add_argument("-p", "--prepare_dataset",      action="store_true",                                            help="Prepare dataset for training")
