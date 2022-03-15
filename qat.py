@@ -113,8 +113,8 @@ def main(rank, args):
         config = json.load(json_config)
 
     # Device
-    device = torch.device("cuda:1")
-    # device = torch.device("cuda:" + str(args.rank) if torch.cuda.is_available() and not args.cpu else "cpu")
+    # device = torch.device("cuda:0,1")
+    device = torch.device("cuda:" + str(args.rank) if torch.cuda.is_available() and not args.cpu else "cpu")
     print("Device:", device)
 
     # Create Tokenizer
@@ -129,17 +129,59 @@ def main(rank, args):
 
     # Create Model
     model = create_model(config).to(device)
-    
+    quantized_model = QuantizedConf(
+        encoder_params=config["encoder_params"],
+        tokenizer_params=config["tokenizer_params"],
+        training_params=config["training_params"],
+        decoding_params=config["decoding_params"],
+        name=config["model_name"])    
+
     # Load Model
     if args.initial_epoch is not None:
-        model.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
+
+        pre_trained = torch.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
+        new=list(pre_trained['model_state_dict'].items())
+
+        my_model_kvpair=model.state_dict()
+        count=0
+        for key,value in my_model_kvpair.items():
+            print(key)
+            layer_name,weights=new[count]      
+            my_model_kvpair[key]=weights
+            count+=1
+            print(count)
+
+        model.load_state_dict(my_model_kvpair)
+        
+        # model.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
         print("Model Loaded!")
     else:
         args.initial_epoch = 0
 
     # Load Encoder Only
     if args.initial_epoch_encoder is not None:
-        model.load_encoder(config["training_params"]["callback_path_encoder"] + "checkpoints_" + str(args.initial_epoch_encoder) + ".ckpt")
+        # model.load_encoder(config["training_params"]["callback_path_encoder"] + "checkpoints_" + str(args.initial_epoch_encoder) + ".ckpt")
+        pre_trained = torch.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch_encoder) + ".ckpt")
+        new=list(pre_trained['model_state_dict'].items())
+
+        my_model_kvpair= quantized_model.encoder.state_dict()
+        
+        print(len(my_model_kvpair.items()))
+        # print(len(new))
+        # for key, value in my_model_kvpair.items():
+        #     print(key)
+        count=0
+        for key,value in my_model_kvpair.items():
+            layer_name,weights=new[count]   
+            print(key, "\t:\t", layer_name)
+            my_model_kvpair[key]=weights
+            count+=1
+            # print(count)
+
+        quantized_model.encoder.load_state_dict(my_model_kvpair)
+        
+        # model.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
+        print("Model Loaded!")
 
     # Load LM
     if args.initial_epoch_lm:
@@ -195,27 +237,20 @@ def main(rank, args):
 
 
     elif args.mode.split("-")[0] == "training":
-        
 
     ###########################################
-
-        quantized_model = QuantizedConf(
-            encoder_params=config["encoder_params"],
-            tokenizer_params=config["tokenizer_params"],
-            training_params=config["training_params"],
-            decoding_params=config["decoding_params"],
-            name=config["model_name"])
         # Using un-fused model will fail.
         # Because there is no quantized layer implementation for a single batch normalization layer.
         # quantized_model = QuantizedConf(model_fp32=model)
-        # Select quantization schemes from 
+        # Select quantization schemes from
         # https://pytorch.org/docs/stable/quantization-support.html
+
         print(quantized_model)
         quantized_model.train()
 
         print("FUSION!")
-        quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.conv1", "encoder.subsampling_module.bn1", "encoder.subsampling_module.relu1"]], inplace=True)
-        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.linear", "encoder.dropout"]], inplace=True)
+        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.conv1","encoder.subsampling_module.bn1", "encoder.subsampling_module.relu1"]], inplace=True)
+        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.conformerb.convolution_module.conv3", "encoder.conformerb.convolution_module.glu2"]], inplace=True)
        
        #for i in range(14):
             #quantized_model = torch.quantization.fuse_modules(quantized_model, [[f"encoder.blocks.{i}.convolution_module.layers.2", f"encoder.blocks.{i}.convolution_module.layers.3"]], inplace=True)
@@ -232,9 +267,17 @@ def main(rank, args):
         quantconfig = torch.quantization.get_default_qconfig("fbgemm")
         print(quantconfig)
         
-        # quantized_model.encoder.subsampling_module.conv1.qconfig = quantconfig
-        quantized_model.qconfig = quantconfig
-        # quantized_model.encoder.linear.qconfig = quantconfig
+        quantized_model.encoder.subsampling_module.conv1.qconfig = quantconfig
+        # quantized_model.qconfig = quantconfig
+        # quantized_model.encoder.conformerb.convolution_module.qconfig = quantconfig
+        # quantized_model.encoder.linear.qconfig = None
+        # quantized_model.encoder.conformerb.multi_head_self_attention_module.mhsa.qconfig = None
+        # quantized_model.encoder.conformerb.convolution_module.conv1.qconfig = None
+        # quantized_model.encoder.conformerb.convolution_module.conv1.qconfig = None
+        # quantized_model.encoder.conformerb.convolution_module.conv2.qconfig = None
+        # quantized_model.encoder.conformerb.convolution_module.conv3.qconfig = None
+
+
         # quantized_model.fc.qconfig = quantconfig
 
         # quantized_model.encoder.preprocessing.qconfig = None
@@ -266,7 +309,7 @@ def main(rank, args):
 
         model_int8 = torch.quantization.convert(quantized_model, inplace=True)
         print(model_int8)
-        torch.save(model_int8, 'model_q.ckpt')
+        model_int8.save("callbacks/EfficientConformerCTCSmall/checkpoints_q.ckpt")
         print("Gready Search Evaluation")
         wer, _, _, _ = model_int8.evaluate(dataset_val, eval_steps=args.val_steps, verbose=args.verbose_val, beam_size=1, eval_loss=args.eval_loss)
         if args.rank == 0:
@@ -368,7 +411,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--distributed",          type=str,   default=None,                                       help="Distributed data parallelization")
     parser.add_argument("-i", "--initial_epoch",        type=str,   default= None,                                       help="Load model from checkpoint")
     parser.add_argument("-lm", "--initial_epoch_lm",    type=str,   default=None,                                       help="Load language model from checkpoint")
-    parser.add_argument("--initial_epoch_encoder",      type=str,   default=None,                                       help="Load model encoder from encoder checkpoint")
+    parser.add_argument("--initial_epoch_encoder",      type=str,   default= "1",                                       help="Load model encoder from encoder checkpoint")
     parser.add_argument("-p", "--prepare_dataset",      action="store_true",                                            help="Prepare dataset for training")
     parser.add_argument("-j", "--num_workers",          type=int,   default=0,                                          help="Number of data loading workers")
     parser.add_argument("--create_tokenizer",           action="store_true",                                            help="Create model tokenizer")
@@ -400,4 +443,4 @@ if __name__ == "__main__":
         os.environ['MASTER_PORT'] = '8888'
         torch.multiprocessing.spawn(main, nprocs=args.world_size, args=(args,))  
     else:
-        main(0, args)
+        main(3, args)
