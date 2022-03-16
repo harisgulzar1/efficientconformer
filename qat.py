@@ -49,6 +49,7 @@ class QuantizedConf(ModelCTC):
         x, _, x_len, _ = batch
         # print("0", x.type())
         x = self.quant(x)
+        print("CHECK")
         # print("BEGIN", x.type())
         logits, logits_len, attentions = self.encoder(x, x_len)
         
@@ -58,7 +59,7 @@ class QuantizedConf(ModelCTC):
         # print(logits)
         x = self.fc(logits)
         # print(x)
-        x = self.dequant(x)
+        # x = self.dequant(x)
         # print("FINAL: ", x.type())
         
 
@@ -129,12 +130,7 @@ def main(rank, args):
 
     # Create Model
     model = create_model(config).to(device)
-    quantized_model = QuantizedConf(
-        encoder_params=config["encoder_params"],
-        tokenizer_params=config["tokenizer_params"],
-        training_params=config["training_params"],
-        decoding_params=config["decoding_params"],
-        name=config["model_name"])    
+
 
     # Load Model
     if args.initial_epoch is not None:
@@ -161,27 +157,38 @@ def main(rank, args):
     # Load Encoder Only
     if args.initial_epoch_encoder is not None:
         # model.load_encoder(config["training_params"]["callback_path_encoder"] + "checkpoints_" + str(args.initial_epoch_encoder) + ".ckpt")
-        pre_trained = torch.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch_encoder) + ".ckpt")
-        new=list(pre_trained['model_state_dict'].items())
+        # pre_trained = torch.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch_encoder) + ".ckpt")
+        # new=list(pre_trained['model_state_dict'].items())
 
-        my_model_kvpair= quantized_model.encoder.state_dict()
-        
-        print(len(my_model_kvpair.items()))
-        # print(len(new))
-        # for key, value in my_model_kvpair.items():
-        #     print(key)
-        count=0
-        for key,value in my_model_kvpair.items():
-            layer_name,weights=new[count]   
-            print(key, "\t:\t", layer_name)
-            my_model_kvpair[key]=weights
-            count+=1
-            # print(count)
+        qinf_model = QuantizedConf(
+            encoder_params=config["encoder_params"],
+            tokenizer_params=config["tokenizer_params"],
+            training_params=config["training_params"],
+            decoding_params=config["decoding_params"],
+            name=config["model_name"]) 
 
-        quantized_model.encoder.load_state_dict(my_model_kvpair)
+        qinf_model.to('cpu')
+
+
+        qinf_model = torch.quantization.fuse_modules(qinf_model, [["encoder.subsampling_module.conv1","encoder.subsampling_module.bn1", "encoder.subsampling_module.relu1"]], inplace=True)
+
+        quantconfig = torch.quantization.get_default_qconfig("fbgemm")
+        print(quantconfig)
+        qinf_model.encoder.subsampling_module.qconfig = quantconfig
+        torch.backends.quantized.engine = 'fbgemm'
         
-        # model.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
-        print("Model Loaded!")
+
+        torch.quantization.prepare_qat(qinf_model, inplace=True)
+
+        modelinf_int8 = torch.quantization.convert(qinf_model, inplace=True)
+
+        modelinf_int8.load(config["training_params"]["callback_path"] + "checkpoints_q.ckpt")
+        
+        # # model.load(config["training_params"]["callback_path"] + "checkpoints_" + str(args.initial_epoch) + ".ckpt")
+        modelinf_int8.to('cpu')
+        modelinf_int8.eval()
+        print("Encoder Loaded!")
+        
 
     # Load LM
     if args.initial_epoch_lm:
@@ -239,6 +246,14 @@ def main(rank, args):
     elif args.mode.split("-")[0] == "training":
 
     ###########################################
+
+        quantized_model = QuantizedConf(
+            encoder_params=config["encoder_params"],
+            tokenizer_params=config["tokenizer_params"],
+            training_params=config["training_params"],
+            decoding_params=config["decoding_params"],
+            name=config["model_name"])    
+
         # Using un-fused model will fail.
         # Because there is no quantized layer implementation for a single batch normalization layer.
         # quantized_model = QuantizedConf(model_fp32=model)
@@ -249,7 +264,7 @@ def main(rank, args):
         quantized_model.train()
 
         print("FUSION!")
-        # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.conv1","encoder.subsampling_module.bn1", "encoder.subsampling_module.relu1"]], inplace=True)
+        quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.subsampling_module.conv1","encoder.subsampling_module.bn1", "encoder.subsampling_module.relu1"]], inplace=True)
         # quantized_model = torch.quantization.fuse_modules(quantized_model, [["encoder.conformerb.convolution_module.conv3", "encoder.conformerb.convolution_module.glu2"]], inplace=True)
        
        #for i in range(14):
@@ -267,7 +282,7 @@ def main(rank, args):
         quantconfig = torch.quantization.get_default_qconfig("fbgemm")
         print(quantconfig)
         
-        quantized_model.encoder.subsampling_module.conv1.qconfig = quantconfig
+        quantized_model.encoder.subsampling_module.qconfig = quantconfig
         # quantized_model.qconfig = quantconfig
         # quantized_model.encoder.conformerb.convolution_module.qconfig = quantconfig
         # quantized_model.encoder.linear.qconfig = None
@@ -311,9 +326,11 @@ def main(rank, args):
         print(model_int8)
         model_int8.save("callbacks/EfficientConformerCTCSmall/checkpoints_q.ckpt")
         print("Gready Search Evaluation")
-        wer, _, _, _ = model_int8.evaluate(dataset_val, eval_steps=args.val_steps, verbose=args.verbose_val, beam_size=1, eval_loss=args.eval_loss)
-        if args.rank == 0:
-            print("Geady Search WER : {:.2f}%".format(100 * wer))
+        
+        print("Model Eval Time")
+        print(model_int8)
+        inf_time = model_int8.eval_time(dataset_val, eval_steps=args.val_steps, beam_size=1, rnnt_max_consec_dec_steps=args.rnnt_max_consec_dec_steps, profiler=args.profiler)
+        print("eval time : {:.2f}s".format(inf_time))
         
         # quantized_model.eval()
         # quantized_model.to('cpu')
@@ -382,7 +399,8 @@ def main(rank, args):
     elif args.mode.split("-")[0] == "eval_time":
 
         print("Model Eval Time")
-        inf_time = model.eval_time(dataset_val, eval_steps=args.val_steps, beam_size=1, rnnt_max_consec_dec_steps=args.rnnt_max_consec_dec_steps, profiler=args.profiler)
+        print(modelinf_int8)
+        inf_time = modelinf_int8.eval_time(dataset_val, eval_steps=args.val_steps, beam_size=1, rnnt_max_consec_dec_steps=args.rnnt_max_consec_dec_steps, profiler=args.profiler)
         print("eval time : {:.2f}s".format(inf_time))
 
     elif args.mode.split("-")[0] == "eval_time_encoder":
@@ -409,9 +427,9 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config_file",          type=str,   default="configs/EfficientConformerCTCSmall.json",  help="Json configuration file containing model hyperparameters")
     parser.add_argument("-m", "--mode",                 type=str,   default="training",                                 help="Mode : training, validation-clean, test-clean, eval_time, audio_lat, ...")
     parser.add_argument("-d", "--distributed",          type=str,   default=None,                                       help="Distributed data parallelization")
-    parser.add_argument("-i", "--initial_epoch",        type=str,   default= None,                                       help="Load model from checkpoint")
+    parser.add_argument("-i", "--initial_epoch",        type=str,   default= None,                                      help="Load model from checkpoint")
     parser.add_argument("-lm", "--initial_epoch_lm",    type=str,   default=None,                                       help="Load language model from checkpoint")
-    parser.add_argument("--initial_epoch_encoder",      type=str,   default= "1",                                       help="Load model encoder from encoder checkpoint")
+    parser.add_argument("--initial_epoch_encoder",      type=str,   default= "q",                                       help="Load model encoder from encoder checkpoint")
     parser.add_argument("-p", "--prepare_dataset",      action="store_true",                                            help="Prepare dataset for training")
     parser.add_argument("-j", "--num_workers",          type=int,   default=0,                                          help="Number of data loading workers")
     parser.add_argument("--create_tokenizer",           action="store_true",                                            help="Create model tokenizer")
